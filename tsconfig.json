@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "preserve",
+    "strict": true,
+    // WHY: src/api/generated 由 openapi-generator 生成（task 2.5），其模板会固定产出
+    // 一批"当次未被引用"的辅助函数/导入（如 *FromJSONTyped 的 ignoreDiscriminator 形参、
+    // mapValues/parseDate 等），且无法通过 generator 配置关闭。TS 不支持按目录粒度覆盖
+    // compilerOptions（除非拆成 composite 子项目并单独构建 .d.ts，维护成本过高），
+    // 故此处全局放宽 noUnusedLocals/noUnusedParameters 两项，其余严格检查（strict 等）不变。
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue", "env.d.ts"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}
