@@ -206,6 +206,21 @@ function ensureAgentPromptLine(): void {
   if (!terminal || agentPromptOpen) return
   terminal.write('\r\n' + AGENT_PROMPT)
   agentPromptOpen = true
+  // 光标已换行离开占位提示行：消费掉清除标志，否则 writeToTerminal
+  // 会先清占位行再清提示行，双清把刚落的 ❯ 也抹掉
+  initialPromptWritten = false
+}
+
+/**
+ * 回合结束主动落位：换行 + 打 ❯ 提示符 + 光标停在输入行（BUG-H）。
+ * WHY: 惰性补打由按键驱动，「输出结束→等待输入」的空档屏幕不会自行
+ *      出现新提示符，用户必须敲一次键盘 ❯ 才被绘制；收尾路径
+ *      （final/error/停止/重连重置）必须主动完成三件事。
+ *      幂等：agentPromptOpen 已置位时不重复打，双触点安全。
+ */
+function openAgentPrompt(): void {
+  if (props.mode !== 'agent') return
+  ensureAgentPromptLine()
 }
 
 function handleAgentKey(data: string): void {
@@ -301,6 +316,13 @@ function writeToTerminal(data: string): void {
     terminal.write('\r\x1b[K')
     initialPromptWritten = false
   }
+  // WHY: 提示行已打开且尚无草稿时不得把输出接在 ❯ 后面——清行复位，
+  //      下一次键入由 ensureAgentPromptLine 惰性补打（与占位行清除同构）；
+  //      草稿非空说明用户正在输入，不能擦掉已键入内容
+  if (terminal && agentPromptOpen && agentDraft === '') {
+    terminal.write('\r\x1b[K')
+    agentPromptOpen = false
+  }
   terminal?.write(data)
   scrollToBottom()
 }
@@ -329,6 +351,7 @@ defineExpose({
   writeToTerminal,
   scrollToBottom,
   refit,
+  openAgentPrompt,
 })
 </script>
 

@@ -263,6 +263,70 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
     expect(mockWrite).toHaveBeenCalledWith(expect.stringContaining('连接中'))
   })
 
+  // ============ 回合结束自动落位提示符（BUG-H：收尾不得把提示符留给下一次按键） ============
+
+  it('openAgentPrompt 主动落位 ❯ 提示行，后续键入直接回显不重复补打', () => {
+    // WHY: 惰性补打由按键驱动，「输出结束→等待输入」空档屏幕无提示符、
+    //      光标不落位（用户实测：必须敲一次键盘 ❯ 才出现）；
+    //      回合收尾路径必须主动完成 换行 + 提示符写入 + 光标定位 三件事
+    const wrapper = mountTimeline('agent')
+    const vm = wrapper.vm as unknown as { openAgentPrompt: () => void }
+    mockWrite.mockClear()
+    vm.openAgentPrompt()
+    expect(mockWrite).toHaveBeenCalledWith('\r\n\x1b[36m❯\x1b[0m ')
+    // 幂等：重复调用不重复打（final 帧与本地闭环可能双触点）
+    mockWrite.mockClear()
+    vm.openAgentPrompt()
+    expect(mockWrite).not.toHaveBeenCalled()
+    // 已落位的提示行可直接续写：键入不再补打提示行
+    mockWrite.mockClear()
+    typeData('x')
+    expect(mockWrite).not.toHaveBeenCalledWith('\r\n\x1b[36m❯\x1b[0m ')
+    expect(mockWrite).toHaveBeenCalledWith('x')
+  })
+
+  it('Shell 模式下 openAgentPrompt 是 no-op（提示符仅属 Agent 输入行）', () => {
+    const wrapper = mountTimeline('shell')
+    const vm = wrapper.vm as unknown as { openAgentPrompt: () => void }
+    mockWrite.mockClear()
+    vm.openAgentPrompt()
+    expect(mockWrite).not.toHaveBeenCalled()
+  })
+
+  it('空提示行上来写入先清行防拼接，键入时惰性补打新提示行', () => {
+    // WHY: 提示符落位后异步 PTY/AI 输出不得接在 ❯ 后面（光标留在提示行内）；
+    //      与初始占位行清除同构：清行复位后交给 ensureAgentPromptLine 兜底
+    const wrapper = mountTimeline('agent')
+    const vm = wrapper.vm as unknown as {
+      openAgentPrompt: () => void
+      writeToTerminal: (data: string) => void
+    }
+    vm.openAgentPrompt()
+    mockWrite.mockClear()
+    vm.writeToTerminal('[AI] 延迟输出')
+    expect(mockWrite).toHaveBeenNthCalledWith(1, '\r\x1b[K')
+    expect(mockWrite).toHaveBeenNthCalledWith(2, '[AI] 延迟输出')
+    // 被清掉的提示行由下一次键入惰性补打兜底
+    mockWrite.mockClear()
+    typeData('y')
+    expect(mockWrite).toHaveBeenNthCalledWith(1, '\r\n\x1b[36m❯\x1b[0m ')
+    expect(mockWrite).toHaveBeenNthCalledWith(2, 'y')
+  })
+
+  it('用户已在提示行键入草稿时写入不清行（不破坏输入中内容）', () => {
+    const wrapper = mountTimeline('agent')
+    const vm = wrapper.vm as unknown as {
+      openAgentPrompt: () => void
+      writeToTerminal: (data: string) => void
+    }
+    vm.openAgentPrompt()
+    typeData('ab')
+    mockWrite.mockClear()
+    vm.writeToTerminal('out')
+    expect(mockWrite).not.toHaveBeenCalledWith('\r\x1b[K')
+    expect(mockWrite).toHaveBeenCalledWith('out')
+  })
+
   // ============ 断线重连（对标 MobaXterm 按 r 重连） ============
 
   it('断线态下普通键入被丢弃：不转发 PTY 也不本地回显', () => {

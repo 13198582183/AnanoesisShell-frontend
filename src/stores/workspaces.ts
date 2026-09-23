@@ -183,7 +183,14 @@ export const useWorkspacesStore = defineStore('workspaces', () => {
     if (ws) ws.controlToken = token
   }
 
-  function setConversationId(id: string, conversationId: string): void {
+  /**
+   * 设置/解绑 tab 的 AI 对话 ID（Agent 记忆的载体）。
+   * @param conversationId 对话 id；传 null 表示解绑——重连时调用：
+   *                  终端会话重建后是全新 shell（cwd/已执行操作全部丢失），
+   *                  旧 Agent 记忆与实况脱节，MUST 重置使下次提问新建会话；
+   *                  旧对话记录仍在库（历史面板可查），仅不再被本 tab 引用
+   */
+  function setConversationId(id: string, conversationId: string | null): void {
     const ws = getById(id)
     if (ws) ws.conversationId = conversationId
   }

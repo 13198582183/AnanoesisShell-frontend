@@ -136,6 +136,15 @@ describe('useWorkspacesStore', () => {
     expect(store.getById(ws.id)?.conversationId).toBe('conv-123')
   })
 
+  it('setConversationId 传 null 解绑对话（重连重置 Agent 记忆：下次提问新建会话）', () => {
+    const store = useWorkspacesStore()
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    store.setConversationId(ws.id, 'conv-123')
+
+    store.setConversationId(ws.id, null)
+    expect(store.getById(ws.id)?.conversationId).toBeNull()
+  })
+
   it('setRemotePath 更新远端目录', () => {
     const store = useWorkspacesStore()
     const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })

@@ -24,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   channels: new Map<string, Array<Record<string, unknown>>>(),
   /** 按通道类型收集 onStateChange 回调，供模拟 WS 层连接状态变化 */
   stateHandlers: new Map<string, Array<(state: string) => void>>(),
+  /** 回合结束自动落位 ❯ 提示符的 spy（BUG-H：收尾不得把提示符留给下一次按键） */
+  openPromptSpy: vi.fn(),
 }))
 
 // Mock 子组件，避免 xterm 真实初始化（per-tab 多实例架构：v-for 渲染，各自持有 sessionId）
@@ -40,6 +42,7 @@ vi.mock('@/components/terminal/TerminalTimeline.vue', () => ({
         writeToTerminal: (...args: unknown[]) => mocks.writeSpy(props.activeSessionId, ...args),
         scrollToBottom: vi.fn(),
         refit: mocks.refitSpy,
+        openAgentPrompt: mocks.openPromptSpy,
       })
     },
   },
@@ -454,6 +457,153 @@ describe('WorkspaceView.vue', () => {
     expect(wrapper.find('[data-action="reconnect"]').exists()).toBe(false)
   })
 
+  it('重连时重置该 tab 的 Agent 对话记忆：conversationId 清空并写边界注记（新会话是全新 shell，旧记忆与实况不一致）', async () => {
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    // 建立会话并产生 Agent 对话（conversation 绑定到 tab）
+    deliverTerm({ type: 'data', session_id: 'sess-old', stream: 'stdout', data: '' })
+    store.setConversationId(ws.id, 'conv-old')
+    // 后端回收会话 → 断线终态
+    deliverTerm({ type: 'closed', session_id: 'sess-old', end_reason: 'timeout' })
+    await flushPromises()
+    expect(store.getById(ws.id)!.conversationId).toBe('conv-old')
+
+    // 点击重连：新终端会话 = 全新 shell，旧对话记忆（cwd/已做操作）与实况脱节，必须重置
+    await wrapper.find('[data-action="reconnect"]').trigger('click')
+    await flushPromises()
+    expect(store.getById(ws.id)!.conversationId).toBeNull()
+    // 边界注记：向用户明示 Agent 上下文已重置（对标断线提示行）
+    const writes = mocks.writeSpy.mock.calls.map(c => String(c[1])).join('')
+    expect(writes).toContain('Agent')
+    expect(writes).toContain('重置')
+  })
+
+  it('重连时先经 AI 通道发 stop_turn 打断旧对话在飞回合再解绑（后端任务必须随重连终结，不阻塞新会话）', async () => {
+    // WHY：用户实测——重连后旧回合仍在后端执行（inFlight 未释放），
+    // 后续提问被 ERR_BUSY「本会话正在处理上一条提问」拒绝。重连即用户
+    // 显式放弃旧回合，必须复用 Ctrl+C 停止链路（stop_turn → 后端 interrupt
+    // + 审批失效 + 终止命令执行），而非只解绑前端记忆
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    // 建立会话、产生 Agent 对话并断线
+    deliverTerm({ type: 'data', session_id: 'sess-old', stream: 'stdout', data: '' })
+    store.setConversationId(ws.id, 'conv-old')
+    deliverTerm({ type: 'closed', session_id: 'sess-old', end_reason: 'timeout' })
+    await flushPromises()
+
+    await wrapper.find('[data-action="reconnect"]').trigger('click')
+    await flushPromises()
+
+    // 解绑前必须先发 stop_turn 上行：后端据此中断旧对话在飞回合并关闭任务执行
+    const aiChannel = mocks.channels.get('ai')![0] as { send: ReturnType<typeof vi.fn> }
+    expect(aiChannel.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'stop_turn', conversation_id: 'conv-old' }),
+    )
+    // 且解绑仍正常完成（停回合不阻断记忆重置）
+    expect(store.getById(ws.id)!.conversationId).toBeNull()
+  })
+
+  it('重连时连带重建 AI 与审批通道：整条 WS 断开后 Agent 提问不得因「AI 通道未连接」静默丢弃', async () => {
+    // WHY：浏览器实测——后端重启后三条通道全死，旧重连链路只重建终端通道，
+    // ai/approval 通道无自动重连，重连后 Agent 提问被 sendAiMessage 的
+    // 「AI 通道未连接」分支静默丢弃，新会话实际仍不可用
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    // 建立会话后整条链路断开（failed 终态，重连按钮出现）
+    deliverTerm({ type: 'data', session_id: 'sess-x', stream: 'stdout', data: '' })
+    deliverTerm({ type: 'closed', session_id: 'sess-x', end_reason: 'timeout' })
+    await flushPromises()
+
+    // 模拟后端重启：AI/审批通道已断开（真实 WsChannel 断开后不会自动重连）
+    const aiChannel = mocks.channels.get('ai')![0] as {
+      state: string
+      connect: ReturnType<typeof vi.fn>
+    }
+    const approvalChannel = mocks.channels.get('approval')![0] as {
+      state: string
+      connect: ReturnType<typeof vi.fn>
+    }
+    aiChannel.state = 'disconnected'
+    approvalChannel.state = 'disconnected'
+    aiChannel.connect.mockClear()
+    approvalChannel.connect.mockClear()
+
+    await wrapper.find('[data-action="reconnect"]').trigger('click')
+    await flushPromises()
+
+    // 重连必须把 AI/审批通道一并拉起（真实 connect 对已连接幂等，无条件调用安全）
+    expect(aiChannel.connect).toHaveBeenCalled()
+    expect(approvalChannel.connect).toHaveBeenCalled()
+  })
+
+  it('整条 WS 断开后重连：stop_turn 延迟到 AI 通道恢复连接后仍要送达旧对话', async () => {
+    // WHY：用户路径复现——Agent 长任务在飞时整条连接断开（网络抖动/vite 重启），
+    // 重连瞬间 aiChannel 还是 disconnected，立即发 stop_turn 会 no-op；
+    // 后端 inFlight 仍被旧回合占用、审批卡残留。必须挂状态回调，通道连上后补发
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    // 建立会话+对话后断线
+    deliverTerm({ type: 'data', session_id: 'sess-d', stream: 'stdout', data: '' })
+    store.setConversationId(ws.id, 'conv-stale')
+    deliverTerm({ type: 'closed', session_id: 'sess-d', end_reason: 'timeout' })
+    await flushPromises()
+
+    // 模拟整条 WS 断开：AI 通道已断（后端重启/刷新场景不同：这里后端存活、旧回合仍在飞）
+    const aiChannel = mocks.channels.get('ai')![0] as {
+      state: string
+      send: ReturnType<typeof vi.fn>
+    }
+    aiChannel.state = 'disconnected'
+    aiChannel.send.mockClear()
+
+    await wrapper.find('[data-action="reconnect"]').trigger('click')
+    await flushPromises()
+
+    // 断开状态下不发帧（send 会抛），但通道恢复后必须补发 stop_turn 给旧对话
+    const aiStateCbs = mocks.stateHandlers.get('ai') ?? []
+    for (const cb of aiStateCbs) cb('connected')
+    await flushPromises()
+    expect(aiChannel.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'stop_turn', conversation_id: 'conv-stale' }),
+    )
+    // 解绑仍正常完成
+    expect(store.getById(ws.id)!.conversationId).toBeNull()
+  })
+
+  it('首连（非重连）不触发记忆重置注记：仅显式重连才清空 conversation', async () => {
+    // 重连是用户显式重建会话的动作才重置；正常首连无旧记忆，不应出现重置注记噪音
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+    mocks.writeSpy.mockClear()
+    deliverTerm({ type: 'data', session_id: 'sess-1', stream: 'stdout', data: '' })
+    await flushPromises()
+    const writes = mocks.writeSpy.mock.calls.map(c => String(c[1])).join('')
+    expect(writes).not.toContain('重置')
+  })
+
   it('WS 层断开时通道未连接：重连走 connect()，建连后自动补发 open', async () => {
     const pinia = createPinia()
     const store = useWorkspacesStore(pinia)
@@ -605,6 +755,109 @@ describe('WorkspaceView.vue', () => {
     // 终端可见停止注记行（不依赖后端收尾帧送达）
     const writes = mocks.writeSpy.mock.calls.map(c => String(c[1])).join('')
     expect(writes).toContain('已被用户停止')
+  })
+
+  // ============ 回合结束自动落位 ❯ 提示符（BUG-H） ============
+
+  it('Agent 模式 final 帧后自动落位提示符（回答完成/取消终结/轮次上限共用路径）', async () => {
+    // WHY: 用户实测——AI 结束对话后需敲一次键盘 ❯ 才出现、光标才落位；
+    //      取消终结/轮次上限也走 finishWithNote+final，故单触点覆盖全部终结路径
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    store.setConversationId(ws.id, 'conv-prompt-1')
+    store.setMode(ws.id, 'agent')
+
+    mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    for (const cb of mocks.channelHandlers.get('ai') ?? []) {
+      cb({ type: 'answer_delta', conversation_id: 'conv-prompt-1', content: '当前目录 /root' })
+    }
+    await flushPromises()
+    expect(mocks.openPromptSpy).not.toHaveBeenCalled()
+
+    for (const cb of mocks.channelHandlers.get('ai') ?? []) {
+      cb({ type: 'final', conversation_id: 'conv-prompt-1', message_id: 'm-1' })
+    }
+    await flushPromises()
+    expect(mocks.openPromptSpy).toHaveBeenCalled()
+  })
+
+  it('Agent 模式 error 帧后也落位提示符（异常收尾同样回到可输入态）', async () => {
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    store.setConversationId(ws.id, 'conv-prompt-2')
+    store.setMode(ws.id, 'agent')
+
+    mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    for (const cb of mocks.channelHandlers.get('ai') ?? []) {
+      cb({ type: 'error', conversation_id: 'conv-prompt-2', message: '模型出错' })
+    }
+    await flushPromises()
+    expect(mocks.openPromptSpy).toHaveBeenCalled()
+  })
+
+  it('Shell 模式 final 帧不落位 Agent 提示符（输入行仅属 Agent 模式）', async () => {
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    store.setConversationId(ws.id, 'conv-prompt-3')
+    // 默认 Shell 模式：回合收尾不应在 PTY 输入流里打 ❯
+
+    mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    for (const cb of mocks.channelHandlers.get('ai') ?? []) {
+      cb({ type: 'final', conversation_id: 'conv-prompt-3', message_id: 'm-1' })
+    }
+    await flushPromises()
+    expect(mocks.openPromptSpy).not.toHaveBeenCalled()
+  })
+
+  it('Ctrl+C 本地闭环停回合后也落位提示符（停完即可继续输入）', async () => {
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    store.setConversationId(ws.id, 'conv-prompt-4')
+    store.setMode(ws.id, 'agent')
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    const timeline = wrapper.findComponent({ name: 'TerminalTimeline' })
+    timeline.vm.$emit('agentInput', '长任务')
+    await flushPromises()
+    timeline.vm.$emit('agentStop')
+    await flushPromises()
+    expect(mocks.openPromptSpy).toHaveBeenCalled()
+  })
+
+  it('断线重连重置对话记忆后落位提示符（重置注记写完即可输入）', async () => {
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    const ws = store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+    store.setConversationId(ws.id, 'conv-prompt-5')
+    store.setMode(ws.id, 'agent')
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+
+    // 先断线进入终态，再触发重连（与重连按钮同路径）
+    deliverTerm({ type: 'data', session_id: 'sess-p5', stream: 'stdout', data: '' })
+    deliverTerm({ type: 'closed', session_id: 'sess-p5', end_reason: 'timeout' })
+    await flushPromises()
+
+    const timeline = wrapper.findComponent({ name: 'TerminalTimeline' })
+    timeline.vm.$emit('reconnect')
+    await flushPromises()
+
+    const writes = mocks.writeSpy.mock.calls.map(c => String(c[1])).join('')
+    expect(writes).toContain('对话记忆已重置')
+    expect(mocks.openPromptSpy).toHaveBeenCalled()
   })
 })
 

@@ -599,6 +599,45 @@ function reconnectWorkspace(wsId: string): void {
   if (!isDisconnectedStatus(ws.status)) return
   workspaceStore.updateStatus(wsId, 'connecting')
   writeToWs(wsId, '\r\n\x1b[36m[正在重连...]\x1b[0m\r\n')
+  // 重置 Agent 对话记忆：重连后终端会话是全新 shell（cwd/已执行操作全部丢失），
+  // 若沿用旧 conversation，模型会携带已死会话的上下文（误认旧 cwd、以为旧命令仍生效）。
+  // 解绑 conversationId 使下次提问自动新建会话；旧对话记录仍入库供历史面板查阅。
+  if (ws.conversationId) {
+    // 先打断旧对话的在飞回合再解绑：重连即用户显式放弃旧回合，若只解绑不终止，
+    // 后端旧回合继续执行（占用 inFlight/审批等待/命令调度），新内容会被
+    // 「本会话正在处理上一条提问」阻塞。复用 Ctrl+C 停止链路：stop_turn 上行
+    // 触发后端 interrupt + 审批失效 + 终止命令执行
+    const staleConvId = ws.conversationId
+    if (rt.aiChannel.state === 'connected') {
+      stopAgentTurn(wsId)
+    } else {
+      // 整条 WS 断开（网络抖动/vite 重启）后重连：此刻 AI 通道尚未恢复，立即发会
+      // no-op；挂一次性状态回调，通道连上后补发 stop_turn 终结旧回合
+      // （stop_turn 是幂等通知，后端未命中在飞回合时无副作用）
+      const unsub = rt.aiChannel.onStateChange((state) => {
+        if (state === 'connected') {
+          unsub()
+          try {
+            rt.aiChannel.send({ type: AiStreamType.StopTurn, conversation_id: staleConvId })
+          } catch {
+            // 通道在回调派发瞬间又断开：旧回合随连接自然清算，不阻断重连流程
+          }
+        }
+      })
+    }
+    workspaceStore.setConversationId(wsId, null)
+    // 同步解除流式锁：旧对话已解绑后其回合收尾帧会被 conversation 归属过滤掉，
+    // 不复位则 aiStreamingByWs 永卡 true、本 tab 输入被永久阻塞
+    aiStreamingByWs.value = { ...aiStreamingByWs.value, [wsId]: false }
+    writeToWs(
+      wsId,
+      '\r\n\x1b[36m[终端会话已重建，Agent 对话记忆已重置（下次提问起于新会话，旧历史可在历史面板查看）]\x1b[0m\r\n',
+    )
+    // 重连收尾后直接可输入：注记写完即落位提示符（BUG-H 触点之一）
+    if (ws.mode === 'agent') {
+      timelineRefs.get(wsId)?.openAgentPrompt()
+    }
+  }
   if (rt.termChannel.state === 'connected') {
     try {
       rt.termChannel.send({ action: TerminalInputAction.Open, host_id: ws.hostId })
@@ -609,6 +648,11 @@ function reconnectWorkspace(wsId: string): void {
   } else {
     rt.termChannel.connect()
   }
+  // 整条 WS 断开（如后端重启）时 AI/审批通道一并死掉，而 WsChannel 无自动重连：
+  // 重连必须连带拉起，否则 Agent 提问会被 sendAiMessage 的「AI 通道未连接」
+  // 分支静默丢弃、审批帧无法送达；connect 对已连接通道幂等，无条件调用安全
+  rt.aiChannel.connect()
+  rt.approvalChannel.connect()
 }
 
 // ==================== AI 通道处理 ====================
@@ -674,6 +718,10 @@ function stopAgentTurn(wsId: string): void {
   // 本地立即复位生成态，不等后端收尾帧（文案与后端 STOPPED_NOTE 对齐）
   aiStreamingByWs.value = { ...aiStreamingByWs.value, [wsId]: false }
   writeToWs(wsId, '\r\n（本轮处理已被用户停止。）\r\n')
+  // 停完即回到可输入态：主动落位提示符，不等后端收尾帧也不等按键（BUG-H）
+  if (ws.mode === 'agent') {
+    timelineRefs.get(wsId)?.openAgentPrompt()
+  }
 }
 
 /**
@@ -755,18 +803,24 @@ function handleAiStream(wsId: string, msg: AiStream): void {
     case AiStreamType.Final:
       closeSeg()
       setStreaming(false)
+      // 回合结束主动落位 ❯（BUG-H）：取消终结/轮次上限也走 finishWithNote+final，
+      // 单触点覆盖全部终结路径；Shell 模式不打（输入行仅属 Agent 模式）
+      if (ws.mode === 'agent') timelineRefs.get(wsId)?.openAgentPrompt()
       break
 
     case AiStreamType.Error:
       closeSeg()
       setStreaming(false)
       write(`\r\n\x1b[31m[AI 错误] ${msg.message ?? 'AI 请求处理出错'}\x1b[0m\r\n`)
+      // 异常收尾同样回到可输入态，不等下一次按键才画提示符
+      if (ws.mode === 'agent') timelineRefs.get(wsId)?.openAgentPrompt()
       break
   }
 }
 
-// WHY: 不在此处补打 Agent 输入提示符——TerminalTimeline 采用惰性补打（用户首次键入时
-//      才在新行写 ❯），父级若抢先写固定提示符会被后续 PTY/AI 输出拼接错位
+// WHY: 提示符落位时机由本文件的四类收尾触点（final/error/停止/重连重置）驱动
+//      TerminalTimeline.openAgentPrompt；除此之外不抢先写固定提示符，
+//      避免与流式输出/PTY 异步输出拼接错位
 
 // ==================== SFTP 文件操作 ====================
 /** 下载远端文件：创建传输任务 → 轮询 ready → 领票 → 触发浏览器下载 */
