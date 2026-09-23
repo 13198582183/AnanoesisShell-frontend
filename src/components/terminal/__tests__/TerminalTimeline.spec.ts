@@ -15,30 +15,47 @@ import TerminalTimeline from '@/components/terminal/TerminalTimeline.vue'
 // 捕获传给 terminal.onData 的回调，便于模拟用户按键
 let capturedOnData: ((data: string) => void) | null = null
 const mockWrite = vi.fn()
+// 捕获最近创建的 Terminal 实例与 FitAddon.fit，供尺寸同步用例改值/断言
+let capturedTerminal: { cols: number; rows: number } | null = null
+const mockFit = vi.fn()
+const mockPropose = vi.fn(() => {
+  const t = capturedTerminal
+  return t ? { cols: t.cols, rows: t.rows } : undefined
+})
+// 捕获组件注册的 ResizeObserver 回调，供用例手动触发容器尺寸变化
+let observerCallbacks: Array<() => void> = []
 
 vi.mock('@xterm/xterm', () => {
   return {
-    Terminal: vi.fn().mockImplementation(() => ({
-      write: mockWrite,
-      dispose: vi.fn(),
-      loadAddon: vi.fn(),
-      reset: vi.fn(),
-      scrollToBottom: vi.fn(),
-      open: vi.fn(),
-      onData: vi.fn((cb: (data: string) => void) => {
-        capturedOnData = cb
-        return { dispose: vi.fn() }
-      }),
-      element: document.createElement('div'),
-      cols: 80,
-      rows: 24,
-    })),
+    Terminal: vi.fn().mockImplementation(() => {
+      const instance = {
+        write: mockWrite,
+        dispose: vi.fn(),
+        loadAddon: vi.fn(),
+        reset: vi.fn(),
+        scrollToBottom: vi.fn(),
+        refresh: vi.fn(),
+        open: vi.fn(),
+        onData: vi.fn((cb: (data: string) => void) => {
+          capturedOnData = cb
+          return { dispose: vi.fn() }
+        }),
+        element: document.createElement('div'),
+        cols: 100,
+        rows: 30,
+      }
+      capturedTerminal = instance
+      return instance
+    }),
   }
 })
 
 vi.mock('@xterm/addon-fit', () => ({
   FitAddon: vi.fn().mockImplementation(() => ({
-    fit: vi.fn(),
+    fit: mockFit,
+    // 真实 fit 在容器不可测量（display:none）时返回 undefined 且不改 cols/rows；
+    // mock 默认回报当前实例尺寸，用例可改写返回值模拟隐藏容器
+    proposeDimensions: mockPropose,
   })),
 }))
 
@@ -58,6 +75,61 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     capturedOnData = null
+    capturedTerminal = null
+    observerCallbacks = []
+    // jsdom 无 ResizeObserver：stub 收集回调，用例手动触发模拟容器尺寸变化
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(cb: () => void) {
+        observerCallbacks.push(cb)
+      }
+      observe() {}
+      disconnect() {}
+    })
+  })
+
+  // ============ winsize 同步（BUG-C：远端 PTY 停留 80x24 导致历史调出重绘错乱） ============
+
+  it('挂载 fit 后 emit resize 把本地尺寸同步给远端 PTY', () => {
+    // WHY: 参照成熟 SSH 客户端——本地终端列数与远端 PTY winsize 必须一致，
+    //      否则 readline 按 80 列计算换行/相对移动，方向键调历史重绘全乱
+    const wrapper = mountTimeline()
+    expect(mockFit).toHaveBeenCalled()
+    expect(wrapper.emitted('resize')).toEqual([[100, 30]])
+  })
+
+  it('refit 强制重发 resize（tab 切回/会话采纳后补发，不依赖尺寸变化）', async () => {
+    const wrapper = mountTimeline()
+    expect(wrapper.emitted('resize')).toHaveLength(1)
+    const vm = wrapper.vm as unknown as { refit: () => void }
+    vm.refit()
+    await nextTick()
+    // 挂载时已同步过 100x30，refit 仍必须补发——隐藏期间容器 0 尺寸导致
+    // 上一轮 emit 被父级守卫丢弃时，这是唯一的补发机会
+    expect(wrapper.emitted('resize')).toHaveLength(2)
+    expect(wrapper.emitted('resize')![1]).toEqual([100, 30])
+  })
+
+  it('隐藏容器（fit 不可测尺寸）时不发 resize，避免误报默认 80x24', () => {
+    // WHY: 后台 tab 挂载时 display:none → fit no-op，此时 terminal.cols/rows 仍是
+    //      初始默认值，若照常上报会把远端会话错误重置成 80x24（切回时才能纠正）
+    mockPropose.mockImplementationOnce(() => undefined)
+    const wrapper = mountTimeline()
+    expect(wrapper.emitted('resize')).toBeUndefined()
+  })
+
+  it('ResizeObserver 感知容器尺寸变化（侧边栏开合）后 emit resize；尺寸未变不重复发', async () => {
+    const wrapper = mountTimeline()
+    expect(observerCallbacks.length).toBeGreaterThan(0)
+    // 侧边栏打开使容器变窄 → fit 后列数变化 → 通知远端
+    capturedTerminal!.cols = 80
+    observerCallbacks.forEach(cb => cb())
+    await nextTick()
+    expect(mockFit).toHaveBeenCalledTimes(2) // 挂载 1 次 + observer 1 次
+    expect(wrapper.emitted('resize')).toEqual([[100, 30], [80, 30]])
+    // 尺寸未再变化：observer 触发 fit 但不重复 emit
+    observerCallbacks.forEach(cb => cb())
+    await nextTick()
+    expect(wrapper.emitted('resize')).toHaveLength(2)
   })
 
   it('渲染终端容器并携带活动会话标识', () => {

@@ -350,6 +350,10 @@ function initWorkspaceRuntime(wsId: string, hostId: string): void {
       runtime.sessionId = msg.session_id
       workspaceStore.setSessionId(wsId, msg.session_id)
       workspaceStore.updateStatus(wsId, 'connected')
+      // WHY: 新会话就绪即驱动一次 refit 强制补发 winsize——后端 PTY 固定 80x24
+      //      分配，挂载时的首次尺寸上报因通道/会话未就绪被守卫丢弃；不补发则
+      //      远端 readline 按 80 列排版，方向键调历史时本地重绘全乱（BUG-C）
+      nextTick(() => timelineRefs.get(wsId)?.refit())
     }
     switch (msg.type) {
       case TerminalOutputType.Data:

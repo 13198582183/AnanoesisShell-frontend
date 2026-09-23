@@ -67,6 +67,11 @@ let terminal: Terminal | null = null
 let fitAddon: FitAddon | null = null
 let resizeHandler: (() => void) | null = null
 let dataDisposable: { dispose: () => void } | null = null
+/** 容器尺寸变化监听（侧边栏开合/tab 切回/窗口缩放）：回调里统一走 syncSize */
+let containerObserver: ResizeObserver | null = null
+/** 最近一次已 emit 给远端的 winsize：去重避免同尺寸重复发帧；0 表示从未同步 */
+let lastSyncedCols = 0
+let lastSyncedRows = 0
 
 /** 是否写了占位提示（“连接中...”或 ❯ 输入符），用于第一条真实输出到达时清除 */
 let initialPromptWritten = false
@@ -132,7 +137,7 @@ function initTerminal(): void {
   if (terminalContainer.value) {
     terminal.open(terminalContainer.value)
   }
-  fitAddon.fit()
+  // 尺寸适配统一由末尾 syncSize() 完成（fit + 上报远端）
 
   // WHY: 统一在 onData 中根据模式分发——Shell 转发 PTY，Agent 本地处理；
   //      断线终态下输入无投递目标，仅保留 r/R 作为重连快捷键（MobaXterm 惯例），
@@ -151,15 +156,44 @@ function initTerminal(): void {
     }
   })
 
-  resizeHandler = () => {
-    fitAddon?.fit()
-    if (terminal) {
-      emit('resize', terminal.cols, terminal.rows)
-    }
-  }
+  resizeHandler = () => syncSize()
   window.addEventListener('resize', resizeHandler)
 
+  // WHY: 监听容器而非 window——侧边栏开合、tab 切回等只改容器尺寸不改窗口，
+  //      远端 PTY 必须随本地列数变化收到 resize，否则 readline 按旧 winsize
+  //      计算换行/相对移动，方向键调历史时重绘全乱（参照成熟 SSH 客户端做法）
+  if (terminalContainer.value && typeof ResizeObserver !== 'undefined') {
+    containerObserver = new ResizeObserver(() => syncSize())
+    containerObserver.observe(terminalContainer.value)
+  }
+
+  // 首次 fit 后立即上报真实尺寸（通道未就绪时父级会丢弃，
+  // 会话采纳时父级再驱动 refit 强制补发，两层保险）
+  syncSize()
+
   showInitialPrompt()
+}
+
+/**
+ * 重新 fit 并把本地尺寸同步给远端 PTY。
+ * WHY: 后端分配 PTY 固定 80x24，若前端从不发 resize，远端 shell 的
+ *      readline 永远按 80 列排版：宽屏下长命令被远端插 \r 折行，
+ *      方向键调历史时重绘字节流与本地实际列数对不上，画面全乱。
+ * @param force 尺寸未变也强制重发——用于隐藏期间 emit 被父级守卫丢弃后的补发
+ */
+function syncSize(force = false): void {
+  if (!terminal || !fitAddon) return
+  // 容器不可测量（v-show 隐藏）时 fit 是 no-op，此时 cols/rows 仍是初始默认值，
+  // 若照常上报会把远端会话错误重置成 80x24——切回可见时 refit 会再补发真实尺寸
+  const dims = fitAddon.proposeDimensions()
+  if (!dims || dims.cols <= 0 || dims.rows <= 0) return
+  fitAddon.fit()
+  const cols = terminal.cols
+  const rows = terminal.rows
+  if (!force && cols === lastSyncedCols && rows === lastSyncedRows) return
+  lastSyncedCols = cols
+  lastSyncedRows = rows
+  emit('resize', cols, rows)
 }
 
 // ==================== Agent 模式内联输入状态 ====================
@@ -242,6 +276,8 @@ function showInitialPrompt(): void {
 function cleanupTerminal(): void {
   dataDisposable?.dispose()
   dataDisposable = null
+  containerObserver?.disconnect()
+  containerObserver = null
   if (resizeHandler) {
     window.removeEventListener('resize', resizeHandler)
     resizeHandler = null
@@ -249,6 +285,9 @@ function cleanupTerminal(): void {
   terminal?.dispose()
   terminal = null
   fitAddon = null
+  // 重置同步记录：重建实例（tab 重建）后首次 syncSize 必 emit
+  lastSyncedCols = 0
+  lastSyncedRows = 0
 }
 
 // ==================== 公共方法 ====================
@@ -272,15 +311,18 @@ function scrollToBottom(): void {
 }
 
 /**
- * 实例从隐藏（v-show=false）切回可见时调用：重新 fit 并重绘全部行。
+ * 实例从隐藏（v-show=false）切回可见、或新会话被采纳时调用：
+ * 重新 fit、重绘全部行，并强制补发 winsize 同步。
  * WHY: 隐藏期间容器尺寸为 0，fitAddon.fit() 静默不生效、渲染器跟不上尺寸，
- *      但 write 进 buffer 的历史不丢——切回后重算尺寸 + refresh 即可完整找回画面。
+ *      但 write 进 buffer 的历史不丢——切回后重算尺寸 + refresh 即可完整找回画面；
+ *      force 重发 resize 是因为隐藏期间的尺寸上报会被父级/零尺寸守卫丢弃，
+ *      不补发则远端 PTY 永远停在旧 winsize（方向键调历史重绘错乱的根因）。
  */
 function refit(): void {
   if (!terminal) return
-  fitAddon?.fit()
   terminal.refresh(0, terminal.rows - 1)
   scrollToBottom()
+  syncSize(true)
 }
 
 defineExpose({

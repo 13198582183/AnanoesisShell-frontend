@@ -16,6 +16,8 @@ import { useWorkspacesStore } from '@/stores/workspaces'
 // 测试内可注入通道回调/终端写入 spy：hoisted 保证 vi.mock 工厂可引用
 const mocks = vi.hoisted(() => ({
   writeSpy: vi.fn(),
+  /** refit spy：断言会话采纳/回活等时机驱动了 winsize 强制同步（BUG-C） */
+  refitSpy: vi.fn(),
   /** 按通道类型收集组件注册的 onMessage 回调，供用例模拟服务端帧 */
   channelHandlers: new Map<string, Array<(msg: unknown) => void>>(),
   /** 按通道类型收集创建的通道实例，供断言 send/connect 调用 */
@@ -37,7 +39,7 @@ vi.mock('@/components/terminal/TerminalTimeline.vue', () => ({
       ctx.expose({
         writeToTerminal: (...args: unknown[]) => mocks.writeSpy(props.activeSessionId, ...args),
         scrollToBottom: vi.fn(),
-        refit: vi.fn(),
+        refit: mocks.refitSpy,
       })
     },
   },
@@ -484,6 +486,49 @@ describe('WorkspaceView.vue', () => {
     await wrapper.find('[data-action="reconnect"]').trigger('click')
     expect(termChannel.connect).toHaveBeenCalled()
     expect(termChannel.send).not.toHaveBeenCalled()
+  })
+
+  // ============ winsize 同步（BUG-C：远端 PTY 停留 80x24，方向键调历史重绘全乱） ============
+
+  it('会话采纳时触发 refit 强制同步 winsize（首连/重连同一路径）', async () => {
+    // WHY: 后端 PTY 固定按 80x24 分配，前端必须在会话就绪后把真实列数
+    //      发过去；不同步则 readline 按 80 列算换行，本地宽屏下历史调出全乱
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+
+    mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+    mocks.refitSpy.mockClear()
+
+    // open 回执携带 session_id → 会话被采纳 → 必须驱动一次 refit 补发尺寸
+    deliverTerm({ type: 'data', session_id: 'sess-1', stream: 'stdout', data: '' })
+    await flushPromises()
+    await nextTick()
+    expect(mocks.refitSpy).toHaveBeenCalled()
+  })
+
+  it('时间线 emit resize → 已连接会话时向终端通道发 resize 帧', async () => {
+    // 锁定链路：组件上报尺寸 → 父级翻译成协议 resize 帧（通道未就绪时被守卫丢弃）
+    const pinia = createPinia()
+    const store = useWorkspacesStore(pinia)
+    store.createWorkspace({ hostId: 'host-1', hostName: 'Server A' })
+
+    const wrapper = mount(WorkspaceView, { global: { plugins: [pinia] } })
+    await flushPromises()
+    deliverTerm({ type: 'data', session_id: 'sess-r', stream: 'stdout', data: '' })
+    await flushPromises()
+
+    const termChannel = mocks.channels.get('term')![0] as { send: ReturnType<typeof vi.fn> }
+    termChannel.send.mockClear()
+    const timeline = wrapper.findComponent({ name: 'TerminalTimeline' })
+    timeline.vm.$emit('resize', 132, 43)
+    expect(termChannel.send).toHaveBeenCalledWith({
+      action: 'resize',
+      session_id: 'sess-r',
+      cols: 132,
+      rows: 43,
+    })
   })
 
   it('TerminalTimeline 上按 r 触发的 reconnect 事件与按钮同路径：重发 open', async () => {
