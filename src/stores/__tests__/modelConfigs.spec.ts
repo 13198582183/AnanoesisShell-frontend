@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { useModelConfigsStore } from '@/stores/modelConfigs'
-import { modelConfigsApi } from '@/api'
+import { modelConfigsApi, ResponseError } from '@/api'
 import type { ModelConfig } from '@/api'
 
 vi.mock('@/api', async (importOriginal) => {
@@ -126,6 +126,24 @@ describe('useModelConfigsStore', () => {
     await store.deleteConfig('cfg-1')
 
     expect(mockApi.deleteModelConfig).toHaveBeenCalledWith({ id: 'cfg-1' })
+  })
+
+  it('deleteConfig() 失败时透出后端可读原因', async () => {
+    // WHY：生成客户端的 ResponseError message 是固定技术黑话
+    // （"Response returned an error code"），store 必须解出契约 Error JSON 的 message
+    const response = new Response(JSON.stringify({ code: 'not_found', message: '模型配置不存在' }), {
+      status: 404,
+      headers: { 'content-type': 'application/json' },
+    })
+    mockApi.deleteModelConfig.mockRejectedValueOnce(
+      new ResponseError(response, 'Response returned an error code'),
+    )
+    const store = useModelConfigsStore()
+
+    const ok = await store.deleteConfig('cfg-missing')
+
+    expect(ok).toBe(false)
+    expect(store.error).toBe('模型配置不存在')
   })
 
   it('setActiveConfig() 切换当前生效配置并刷新列表', async () => {

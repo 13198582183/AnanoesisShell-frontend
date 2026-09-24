@@ -1,0 +1,6 @@
+# 桌面壳独立包：node_modules 与产物不进 git；
+# build/ 是构建脚本组装出的 JRE/jar/dist 暂存位（extraResources 来源），同样不提交。
+node_modules/
+out/
+dist-release/
+build/

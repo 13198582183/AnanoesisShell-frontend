@@ -1,0 +1,52 @@
+# electron-builder 组装配置（任务 5.1/5.2，design D6/D7/D11）。
+# 产物布局与 frontend/desktop/src/launch-layout.ts 的生产契约互为钉住：
+#   resources/runtime/bin/java.exe · resources/backend/app.jar · resources/dist
+appId: net.liziwen.ananoesisshell
+productName: AnanoesisShell
+copyright: Copyright © 2026 李仔文 (liziwen)
+
+# 壳只带 out/ 编译产物；三样大件经 extraResources 从 build/ 暂存位搬入
+files:
+  - out/**/*
+  - package.json
+
+extraResources:
+  - from: build/runtime
+    to: runtime
+  - from: build/backend/app.jar
+    to: backend/app.jar
+  - from: build/dist
+    to: dist
+
+directories:
+  output: dist-release
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  # 发行者身份（任务 5.2，spec「安装后发行者可见」）：electron-builder 26 的
+  # exe CompanyName 与「应用和功能」Publisher 均取自 package.json 的
+  # author.name = "李仔文 (liziwen)"（appInfo.companyName 源码实证）；
+  # 旧字段 win.company 已被移除，写了会被 schema 拒绝
+  legalTrademarks: AnanoesisShell 李仔文 liziwen
+  # 应用图标（任务 5.2）：桌面快捷方式/exe 文件图标取自 assets/icon.png
+  # （≥256x256 PNG，builder 自动转多尺寸 .ico）；不配则回退 Electron 默认原子图标
+  icon: assets/icon.png
+  # 签名钩子（design D11）：证书存在时经环境变量启用；无证书 = 如实未签名，
+  # 由构建脚本打印「未签名」声明，绝不伪称已签
+  # certificateFile/certificatePassword 由 build-desktop.ps1 检测环境变量后传入
+
+nsis:
+  # 卸载器不触碰用户数据目录（spec「安装、卸载与数据位置」；%USERPROFILE%\.ananoesis 与 userData 留存）
+  deleteAppDataOnUninstall: false
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: true
+  # 发布者显示名：同上任由 package.json author.name 流入，无独立配置字段
+  artifactName: AnanoesisShell-Setup-${version}.${ext}
+  uninstallDisplayName: AnanoesisShell（让 Linux 运维不再困难）
+  # 自定义钩子（installer/installer.nsh）：升级安装时强制重建桌面快捷方式+刷图标缓存；
+  # 不放默认 build/ 位是因为那是构建脚本每次清空重建的暂存目录
+  include: installer/installer.nsh

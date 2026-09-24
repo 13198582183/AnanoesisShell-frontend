@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { modelConfigsApi, type ModelConfig } from '@/api'
+import { modelConfigsApi, describeApiError, type ModelConfig } from '@/api'
 
 /**
  * 新增/编辑模型配置时提交的表单载荷类型（排除只读字段）。
@@ -38,13 +38,21 @@ export const useModelConfigsStore = defineStore('modelConfigs', () => {
     error.value = null
   }
 
+  /**
+   * WHY 统一走 describeApiError：生成客户端的 ResponseError 会把后端可读原因
+   * 吞成 "Response returned an error code"，设置页的 banner 必须透出真实 message。
+   */
+  async function recordError(e: unknown): Promise<void> {
+    error.value = await describeApiError(e)
+  }
+
   async function fetchConfigs(): Promise<void> {
     loading.value = true
     resetError()
     try {
       configs.value = await modelConfigsApi.listModelConfigs()
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      await recordError(e)
       configs.value = []
     } finally {
       loading.value = false
@@ -58,7 +66,7 @@ export const useModelConfigsStore = defineStore('modelConfigs', () => {
       await fetchConfigs()
       return true
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      await recordError(e)
       return false
     }
   }
@@ -70,7 +78,7 @@ export const useModelConfigsStore = defineStore('modelConfigs', () => {
       await fetchConfigs()
       return true
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      await recordError(e)
       return false
     }
   }
@@ -82,7 +90,7 @@ export const useModelConfigsStore = defineStore('modelConfigs', () => {
       await fetchConfigs()
       return true
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      await recordError(e)
       return false
     }
   }
@@ -94,7 +102,7 @@ export const useModelConfigsStore = defineStore('modelConfigs', () => {
       await fetchConfigs()
       return true
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      await recordError(e)
       return false
     }
   }

@@ -2,3 +2,7 @@ node_modules
 dist
 *.local
 .DS_Store
+# 桌面壳构建产物（任务 5.1）：tsc 输出 / electron-builder 暂存 / 安装包产物
+desktop/out/
+desktop/build/
+desktop/dist-release/

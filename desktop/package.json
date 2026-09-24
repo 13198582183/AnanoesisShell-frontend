@@ -1,0 +1,20 @@
+{
+  "name": "ananoesis-shell-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AnanoesisShell 桌面壳：监管本机 Spring Boot 后端并承载同源页面（见 openspec 变更 add-desktop-client）",
+  "author": {
+    "name": "李仔文 liziwen"
+  },
+  "main": "out/main.js",
+  "scripts": {
+    "build:main": "tsc -p tsconfig.json",
+    "dev": "npm run build:main && electron .",
+    "dist": "npm run build:main && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "typescript": "5.6.3"
+  }
+}

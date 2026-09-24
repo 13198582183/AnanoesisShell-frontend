@@ -37,8 +37,10 @@
       <p v-if="modelConfigsStore.needsApiKeyWarning" class="warning-banner">
         请先在设置中配置模型 api key
       </p>
+      <!-- WHY「操作失败」而非「加载失败」：同一 error 也被新增/编辑/删除复用，
+           写死「加载失败」会把删除失败误导成列表加载出了问题 -->
       <p v-if="modelConfigsStore.error" class="error-banner">
-        模型配置加载失败：{{ modelConfigsStore.error }}
+        模型配置操作失败：{{ modelConfigsStore.error }}
       </p>
       <p v-if="modelConfigsStore.loading" class="loading">加载中...</p>
 
