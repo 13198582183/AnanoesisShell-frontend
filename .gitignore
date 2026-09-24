@@ -6,3 +6,6 @@ dist
 desktop/out/
 desktop/build/
 desktop/dist-release/
+
+# vite 依赖缓存（在 frontend 根目录跑 vite/vitest 时产生）
+.vite/
